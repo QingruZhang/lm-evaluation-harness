@@ -1,1 +1,4 @@
 -e .
+immutabledict 
+langdetect
+nltk==3.8.1

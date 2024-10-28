@@ -5,12 +5,14 @@ import os
 import sys
 from functools import partial
 from typing import Union
+from pathlib import Path
 
 from lm_eval import evaluator, utils
 from lm_eval.evaluator import request_caching_arg_to_dict
 from lm_eval.loggers import EvaluationTracker, WandbLogger
 from lm_eval.tasks import TaskManager
 from lm_eval.utils import handle_non_serializable, make_table, simple_parse_args_string
+from torch.utils.tensorboard import SummaryWriter
 
 
 def _int_or_none_list_arg_type(
@@ -112,12 +114,36 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Device to use (e.g. cuda, cuda:0, cpu).",
     )
     parser.add_argument(
+        "--apply_tb_writter",
+        action="store_true", 
+        help="",
+    )
+    parser.add_argument(
+        "--root_output_dir",
+        default="outputs",
+        type=str,
+        metavar="DIR|DIR/file.json",
+        help="The root output dir.",
+    )
+    parser.add_argument(
         "--output_path",
         "-o",
         default=None,
         type=str,
         metavar="DIR|DIR/file.json",
         help="The path to the output file where the result metrics will be saved. If the path is a directory and log_samples is true, the results will be saved in the directory. Else the parent directory will be used.",
+    )
+    parser.add_argument(
+        "--global_step",
+        default=None,
+        type=int,
+        help="",
+    )
+    parser.add_argument(
+        "--max_training_step",
+        default=200,
+        type=int,
+        help="",
     )
     parser.add_argument(
         "--limit",
@@ -229,6 +255,11 @@ def setup_parser() -> argparse.ArgumentParser:
         default=False,
         help="Use with --log_samples. Only model outputs will be saved and metrics will not be evaluated.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug.",
+    )
     default_seed_string = "0,1234,1234,1234"
     parser.add_argument(
         "--seed",
@@ -259,10 +290,31 @@ def parse_eval_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
 
 
 def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
-    if not args:
+    if not args: 
         # we allow for args to be passed externally, else we parse them ourselves
         parser = setup_parser()
         args = parse_eval_args(parser)
+        if args.debug:
+            import ipdb 
+            ipdb.set_trace()
+        root_output_dir = Path(args.root_output_dir) 
+        model_path = simple_parse_args_string(args.model_args)['pretrained'] 
+        if "DataLog" in model_path:
+            output_dir = model_path.split("DataLog/")[1]
+        else:
+            output_dir = model_path.removeprefix("/fsx-Training/home/zqingru/")
+        if "save_training_checkpoints" in output_dir:
+            if "global_step" in output_dir.split("save_training_checkpoints")[1]:
+                global_step = int(output_dir.split("save_training_checkpoints")[1].split("global_step")[-1])
+                args.global_step = global_step
+            output_dir = output_dir.split("save_training_checkpoints")[0]
+        for subdir in ["training_checkpoints", "save_model"]:
+            output_dir = output_dir.removesuffix("/")
+            output_dir = output_dir.removesuffix(subdir)
+        output_path = root_output_dir / output_dir 
+        output_path.mkdir(exist_ok=True, parents=True)
+        args.output_path = str(output_path.resolve())
+        print(args.output_path)
 
     if args.wandb_args:
         wandb_logger = WandbLogger(**simple_parse_args_string(args.wandb_args))
@@ -408,6 +460,10 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     )
 
     if results is not None:
+        if args.debug:
+            import ipdb 
+            ipdb.set_trace() 
+        
         if args.log_samples:
             samples = results.pop("samples")
         dumped = json.dumps(
@@ -417,6 +473,23 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
             print(dumped)
 
         batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
+
+        if args.apply_tb_writter:
+            tb_writter = SummaryWriter(
+                log_dir=os.path.join(args.output_path, "tensorboard")
+            ) 
+            global_step = args.global_step if args.global_step else args.max_training_step
+            for task_name in results["results"]:
+                metric_keys = [
+                    key for key in results["results"][task_name] if key not in ["alias"]
+                ]
+                for key in metric_keys:
+                    value = results["results"][task_name][key]
+                    if isinstance(value, float) or isinstance(value, int):
+                        tb_writter.add_scalar(
+                            f"{task_name}/{key}", value, global_step
+                        )
+            tb_writter.close() 
 
         # Add W&B logging
         if args.wandb_args:
